@@ -71,6 +71,23 @@ class SoundController {
       osc.stop(this.ctx.currentTime + 0.16);
     } catch (e) {}
   }
+
+  boostSound() {
+    if (!this.enabled || !this.ctx) return;
+    try {
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(380, this.ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(1200, this.ctx.currentTime + 0.24);
+      gain.gain.setValueAtTime(0.18, this.ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + 0.24);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start();
+      osc.stop(this.ctx.currentTime + 0.24);
+    } catch (e) {}
+  }
 }
 
 // --- PARTICLE EFFECT SYSTEM ---
@@ -157,6 +174,9 @@ const MIN_VX = 4.2; // Minimum horizontal speed to eliminate slow vertical crawl
 const SPEED_ACCEL_PER_SEC = 0.32; // Progressive acceleration per second as a round continues
 const SLOMO_ZONE_X = canvas.width * 0.25; // 25% of court (last quarter of player's side)
 const SLOMO_FACTOR = 0.48; // Slow-motion speed multiplier (50% faster than previous 0.32)
+const CENTER_CIRCLE_RADIUS = 70; // Center circle zone radius
+const CENTER_BOOST_MULTIPLIER = 2.0; // 2x speed boost when crossing through center ring
+let centerCirclePulse = 0; // Visual shockwave animation timer
 
 let state = 'READY'; // READY, PLAYING, PAUSED, OVER
 let playerScore = 0;
@@ -207,9 +227,11 @@ const ball = {
   radius: BALL_SIZE,
   speed: BASE_SPEED,
   spin: 0,
+  isBoosted: false,
+  hasLeftCenterOnServe: false,
   trail: [],
   enforceMinVx() {
-    const minVx = Math.max(MIN_VX, this.speed * 0.3);
+    const minVx = Math.max(MIN_VX, this.speed * 0.42);
     if (Math.abs(this.vx) < minVx) {
       const dir = Math.sign(this.vx) || 1;
       this.vx = dir * minVx;
@@ -223,6 +245,8 @@ const ball = {
     this.y = canvas.height / 2;
     this.speed = BASE_SPEED;
     this.spin = 0;
+    this.isBoosted = false;
+    this.hasLeftCenterOnServe = false;
     this.trail = [];
 
     // Launch angle between -30° and +30°
@@ -464,8 +488,9 @@ function update(dt = 1.0) {
     targetCpuY = canvas.height / 2;
   }
 
-  // CPU reaction speed scales with accelerating round speed to keep rallies intense
-  const speedRatio = ball.speed / BASE_SPEED;
+  // CPU reaction speed scales with accelerating round speed and active 2x boost
+  const effectiveCurrentSpeed = ball.speed * (ball.isBoosted ? 1.75 : 1.0);
+  const speedRatio = effectiveCurrentSpeed / BASE_SPEED;
   const currentCpuSpeed = profile.maxSpeed * (1 + (speedRatio - 1) * 0.45);
 
   const diff = targetCpuY - cpuCenter;
@@ -489,6 +514,29 @@ function update(dt = 1.0) {
     ball.vy *= scaleFactor;
   }
 
+  // Center Circle 2X Boost Check
+  const centerX = canvas.width / 2;
+  const centerY = canvas.height / 2;
+  const distToCenter = Math.hypot(ball.x - centerX, ball.y - centerY);
+
+  // Check if ball cleared center ring after serve
+  if (!ball.hasLeftCenterOnServe && distToCenter > CENTER_CIRCLE_RADIUS + 12) {
+    ball.hasLeftCenterOnServe = true;
+  }
+
+  // Passing through the center circle triggers 2X speed boost for this shot!
+  if (ball.hasLeftCenterOnServe && !ball.isBoosted && distToCenter <= CENTER_CIRCLE_RADIUS) {
+    ball.isBoosted = true;
+    centerCirclePulse = 1.0;
+    sound.boostSound();
+    particles.createBurst(ball.x, ball.y, '#00ffcc', 20);
+  }
+
+  // Decay center circle pulse animation
+  if (centerCirclePulse > 0) {
+    centerCirclePulse = Math.max(0, centerCirclePulse - 0.04 * dt);
+  }
+
   const currentlyInSloMo = sloMoEnabled && (ball.x <= SLOMO_ZONE_X) && (ball.vx < 0);
   
   if (currentlyInSloMo && !isInSloMo) {
@@ -497,7 +545,9 @@ function update(dt = 1.0) {
   }
   isInSloMo = currentlyInSloMo;
 
-  const timeScale = currentlyInSloMo ? SLOMO_FACTOR : 1.0;
+  // Apply both Slo-Mo and 2X Center Boost if active
+  const boostFactor = ball.isBoosted ? CENTER_BOOST_MULTIPLIER : 1.0;
+  const timeScale = (currentlyInSloMo ? SLOMO_FACTOR : 1.0) * boostFactor;
 
   // Apply Curve Physics: ball.spin bends the vertical velocity over time (dt normalized)
   if (curveEnabled && Math.abs(ball.spin) > 0.005) {
@@ -516,10 +566,10 @@ function update(dt = 1.0) {
   ball.x += ball.vx * timeScale * dt;
   ball.y += ball.vy * timeScale * dt;
 
-  // Ball trail effect (longer trail as round speed climbs)
+  // Ball trail effect (longer trail when boosted or at high round speed)
   const isCurved = curveEnabled && Math.abs(ball.spin) > 0.08;
-  ball.trail.push({ x: ball.x, y: ball.y, isSloMo: currentlyInSloMo, isCurved });
-  const maxTrail = currentlyInSloMo ? 14 : Math.min(13, Math.floor(6 + (ball.speed - BASE_SPEED) * 0.7));
+  ball.trail.push({ x: ball.x, y: ball.y, isSloMo: currentlyInSloMo, isCurved, isBoosted: ball.isBoosted });
+  const maxTrail = currentlyInSloMo ? 14 : (ball.isBoosted ? 16 : Math.min(13, Math.floor(6 + (ball.speed - BASE_SPEED) * 0.7)));
   if (ball.trail.length > maxTrail) {
     ball.trail.shift();
   }
@@ -593,6 +643,12 @@ function handlePaddleHit(paddle) {
   const offset = (ball.y - paddleCenter) / (paddle.height / 2);
   const maxBounceAngle = (5 * Math.PI) / 16; // ~56.25 degrees max (prevents slow vertical crawling)
   const bounceAngle = offset * maxBounceAngle;
+
+  // If the ball was in 2X boost mode, consume the boost upon paddle return
+  if (ball.isBoosted) {
+    particles.createBurst(ball.x, ball.y, '#00ffcc', 20);
+    ball.isBoosted = false;
+  }
 
   // Increase speed slightly with each volley
   ball.speed = Math.min(ball.speed + 0.35, MAX_BALL_SPEED);
@@ -686,30 +742,60 @@ function draw() {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Draw Center Circle
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-  ctx.lineWidth = 2;
+  // Draw Center Circle (2X Boost Gate)
+  ctx.save();
+  const isPulseActive = centerCirclePulse > 0;
+  ctx.strokeStyle = isPulseActive ? 'rgba(0, 255, 204, 0.85)' : 'rgba(0, 255, 204, 0.2)';
+  ctx.lineWidth = isPulseActive ? 3 : 2;
+  ctx.shadowColor = 'rgba(0, 255, 204, 0.8)';
+  ctx.shadowBlur = isPulseActive ? 22 : 6;
+  ctx.setLineDash([8, 6]);
   ctx.beginPath();
-  ctx.arc(canvas.width / 2, canvas.height / 2, 70, 0, Math.PI * 2);
+  ctx.arc(canvas.width / 2, canvas.height / 2, CENTER_CIRCLE_RADIUS, 0, Math.PI * 2);
   ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Expanding shockwave ring when boost activates
+  if (centerCirclePulse > 0) {
+    ctx.strokeStyle = `rgba(0, 255, 204, ${centerCirclePulse * 0.9})`;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    const shockwaveRadius = CENTER_CIRCLE_RADIUS + (1 - centerCirclePulse) * 45;
+    ctx.arc(canvas.width / 2, canvas.height / 2, shockwaveRadius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Gate label in center
+  ctx.font = '600 11px Rajdhani';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = isPulseActive ? '#00ffcc' : 'rgba(0, 255, 204, 0.35)';
+  ctx.fillText('⚡ 2X BOOST', canvas.width / 2, canvas.height / 2 + 4);
+  ctx.restore();
 
   // Draw Live Round Speed HUD (top center)
-  const speedRatio = ball.speed / BASE_SPEED;
+  const currentEffectiveRatio = (ball.speed / BASE_SPEED) * (ball.isBoosted ? 2.0 : 1.0);
   ctx.save();
   ctx.font = '700 12px Rajdhani, sans-serif';
   ctx.textAlign = 'center';
-  if (speedRatio >= 1.6) {
+  if (ball.isBoosted) {
+    ctx.fillStyle = '#00ffcc';
+    ctx.shadowColor = 'rgba(0, 255, 204, 0.95)';
+    ctx.shadowBlur = 12;
+    ctx.fillText(`⚡ SPEED ${currentEffectiveRatio.toFixed(1)}x [2X BOOST ACTIVE!]`, canvas.width / 2, 28);
+  } else if (currentEffectiveRatio >= 1.6) {
     ctx.fillStyle = '#ff007b';
     ctx.shadowColor = 'rgba(255, 0, 123, 0.8)';
     ctx.shadowBlur = 8;
-  } else if (speedRatio >= 1.25) {
+    ctx.fillText(`⚡ SPEED ${currentEffectiveRatio.toFixed(1)}x`, canvas.width / 2, 28);
+  } else if (currentEffectiveRatio >= 1.25) {
     ctx.fillStyle = '#ffe600';
     ctx.shadowColor = 'rgba(255, 230, 0, 0.7)';
     ctx.shadowBlur = 6;
+    ctx.fillText(`⚡ SPEED ${currentEffectiveRatio.toFixed(1)}x`, canvas.width / 2, 28);
   } else {
     ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+    ctx.fillText(`⚡ SPEED ${currentEffectiveRatio.toFixed(1)}x`, canvas.width / 2, 28);
   }
-  ctx.fillText(`⚡ SPEED ${speedRatio.toFixed(1)}x`, canvas.width / 2, 28);
   ctx.restore();
 
   // Draw Ball Trail
@@ -720,16 +806,18 @@ function draw() {
     let trailColor = '#ffe600';
     if (pt.isSloMo) {
       trailColor = '#00f3ff';
+    } else if (pt.isBoosted) {
+      trailColor = '#00ffcc'; // Hyper cyan-green boost trail!
     } else if (pt.isCurved) {
       trailColor = '#d880ff';
-    } else if (speedRatio >= 1.5) {
+    } else if (currentEffectiveRatio >= 1.5) {
       trailColor = '#ff6b00'; // High-speed thermal fire trail!
     }
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.fillStyle = trailColor;
     ctx.shadowColor = trailColor;
-    ctx.shadowBlur = (pt.isSloMo || pt.isCurved || speedRatio >= 1.5) ? 12 : 4;
+    ctx.shadowBlur = (pt.isSloMo || pt.isCurved || pt.isBoosted || currentEffectiveRatio >= 1.5) ? 12 : 4;
     ctx.beginPath();
     ctx.arc(pt.x, pt.y, size, 0, Math.PI * 2);
     ctx.fill();
@@ -745,27 +833,37 @@ function draw() {
   if (isInSloMo) {
     ballColor = '#00f3ff';
     glowColor = 'rgba(0, 243, 255, 0.95)';
+  } else if (ball.isBoosted) {
+    ballColor = '#00ffcc';
+    glowColor = 'rgba(0, 255, 204, 0.98)';
   } else if (isCurving) {
     ballColor = '#f080ff';
     glowColor = 'rgba(176, 38, 255, 0.95)';
-  } else if (speedRatio >= 1.55) {
+  } else if (currentEffectiveRatio >= 1.55) {
     ballColor = '#ff3366'; // Fiery plasma ball at high speed
     glowColor = 'rgba(255, 51, 102, 0.95)';
   }
 
   ctx.fillStyle = ballColor;
   ctx.shadowColor = glowColor;
-  ctx.shadowBlur = (isInSloMo || isCurving || speedRatio >= 1.55) ? 22 : 16;
+  ctx.shadowBlur = (isInSloMo || isCurving || ball.isBoosted || currentEffectiveRatio >= 1.55) ? 24 : 16;
   ctx.beginPath();
   ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
   ctx.fill();
 
-  // Time-dilation ripple ring when in slo-mo
+  // Time-dilation ripple ring when in slo-mo, or boost pulse ring
   if (isInSloMo) {
     ctx.strokeStyle = 'rgba(0, 243, 255, 0.7)';
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(ball.x, ball.y, ball.radius + 6, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (ball.isBoosted) {
+    // Electric 2x speed boost halo
+    ctx.strokeStyle = '#00ffcc';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.radius + 5, 0, Math.PI * 2);
     ctx.stroke();
   } else if (isCurving) {
     // Spinning energy vortex arc around ball
