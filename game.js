@@ -96,12 +96,12 @@ class ParticleSystem {
     }
   }
 
-  update() {
+  update(dt = 1.0) {
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
-      p.x += p.vx;
-      p.y += p.vy;
-      p.alpha -= p.life;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.alpha -= p.life * dt;
       if (p.alpha <= 0) {
         this.particles.splice(i, 1);
       }
@@ -384,6 +384,35 @@ function toggleCurve() {
   }
 }
 
+// Fullscreen toggle
+const fullscreenBtn = document.getElementById('fullscreen-btn');
+if (fullscreenBtn) {
+  fullscreenBtn.addEventListener('click', () => {
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      const docEl = document.documentElement;
+      if (docEl.requestFullscreen) {
+        docEl.requestFullscreen().catch(() => {});
+      } else if (docEl.webkitRequestFullscreen) {
+        docEl.webkitRequestFullscreen();
+      }
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      } else if (document.webkitExitFullscreen) {
+        document.webkitExitFullscreen();
+      }
+    }
+  });
+
+  const updateFsBtn = () => {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    fullscreenBtn.textContent = isFs ? '⛶ Exit' : '⛶ Fullscreen';
+  };
+
+  document.addEventListener('fullscreenchange', updateFsBtn);
+  document.addEventListener('webkitfullscreenchange', updateFsBtn);
+}
+
 function showStartScreen() {
   state = 'READY';
   overlayTitle.textContent = 'READY TO PLAY?';
@@ -401,16 +430,16 @@ function resetMatch() {
   ball.reset(true);
 }
 
-// --- UPDATE LOOP ---
-function update() {
+// --- UPDATE LOOP (Frame-Rate Independent) ---
+function update(dt = 1.0) {
   if (state !== 'PLAYING') return;
 
-  // 1. Move Player paddle (smooth snap to mouse position)
+  // 1. Move Player paddle (smooth snap to mouse/touch, dt normalized)
   player.prevY = player.y;
-  player.y += (player.targetY - player.y) * 0.35;
-  player.vy = player.y - player.prevY;
+  player.y += (player.targetY - player.y) * Math.min(1.0, 0.35 * dt);
+  player.vy = (player.y - player.prevY) / dt;
 
-  // 2. Move CPU paddle (AI)
+  // 2. Move CPU paddle (AI, dt normalized)
   cpu.prevY = cpu.y;
   const profile = AI_PROFILES[difficulty];
   const cpuCenter = cpu.y + cpu.height / 2;
@@ -424,12 +453,12 @@ function update() {
 
   const diff = targetCpuY - cpuCenter;
   if (Math.abs(diff) > profile.errorMargin) {
-    const moveStep = Math.sign(diff) * Math.min(Math.abs(diff), profile.maxSpeed);
+    const moveStep = Math.sign(diff) * Math.min(Math.abs(diff), profile.maxSpeed * dt);
     cpu.y += moveStep;
   }
   // Clamp CPU paddle
   cpu.y = Math.max(8, Math.min(canvas.height - cpu.height - 8, cpu.y));
-  cpu.vy = cpu.y - cpu.prevY;
+  cpu.vy = (cpu.y - cpu.prevY) / dt;
 
   // 3. Move Ball (with Slo-Mo in last quarter of player's court)
   const currentlyInSloMo = sloMoEnabled && (ball.x <= SLOMO_ZONE_X) && (ball.vx < 0);
@@ -442,18 +471,18 @@ function update() {
 
   const timeScale = currentlyInSloMo ? SLOMO_FACTOR : 1.0;
 
-  // Apply Curve Physics: ball.spin bends the vertical velocity over time
+  // Apply Curve Physics: ball.spin bends the vertical velocity over time (dt normalized)
   if (curveEnabled && Math.abs(ball.spin) > 0.005) {
-    ball.vy += ball.spin * 1.5 * timeScale;
-    ball.spin *= 0.985; // Air resistance gradually neutralizes spin
+    ball.vy += ball.spin * 1.5 * timeScale * dt;
+    ball.spin *= Math.pow(0.985, dt); // Air resistance gradually neutralizes spin
     // Sparkle trail on strong spin
-    if (Math.abs(ball.spin) > 0.1 && Math.random() < 0.35) {
+    if (Math.abs(ball.spin) > 0.1 && Math.random() < 0.35 * dt) {
       particles.createBurst(ball.x, ball.y, '#d880ff', 2);
     }
   }
 
-  ball.x += ball.vx * timeScale;
-  ball.y += ball.vy * timeScale;
+  ball.x += ball.vx * timeScale * dt;
+  ball.y += ball.vy * timeScale * dt;
 
   // Ball trail effect
   const isCurved = curveEnabled && Math.abs(ball.spin) > 0.08;
@@ -519,7 +548,7 @@ function update() {
   }
 
   // Update particle system
-  particles.update();
+  particles.update(dt);
 }
 
 function handlePaddleHit(paddle) {
@@ -712,9 +741,21 @@ function drawPaddle(x, y, w, h, color, glowColor) {
   ctx.restore();
 }
 
-// Main Game Loop
-function loop() {
-  update();
+// Main Game Loop (Frame-Rate Independent with Delta Time)
+let lastFrameTimestamp = 0;
+
+function loop(timestamp = 0) {
+  if (!lastFrameTimestamp) lastFrameTimestamp = timestamp;
+  const elapsedSec = (timestamp - lastFrameTimestamp) / 1000;
+  lastFrameTimestamp = timestamp;
+
+  // Frame-rate normalization:
+  // Base physics is tuned for 60 FPS (1 / 60 ≈ 0.01667s per frame).
+  // On 120Hz/144Hz screens, dt ≈ 0.5. On 60Hz screens, dt ≈ 1.0.
+  // Clamp between 0.1 and 2.5 to avoid large physics glitches on tab resume.
+  const dt = Math.max(0.1, Math.min(elapsedSec / 0.016667, 2.5));
+
+  update(dt);
   draw();
   requestAnimationFrame(loop);
 }
