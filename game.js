@@ -152,7 +152,9 @@ const PADDLE_WIDTH = 14;
 const PADDLE_HEIGHT = 90;
 const BALL_SIZE = 10;
 const BASE_SPEED = 7;
-const MAX_BALL_SPEED = 16;
+const MAX_BALL_SPEED = BASE_SPEED * 6.9; // 48.3 (exact 6.9x speed multiplier cap)
+const MIN_VX = 4.2; // Minimum horizontal speed to eliminate slow vertical crawls
+const SPEED_ACCEL_PER_SEC = 0.32; // Progressive acceleration per second as a round continues
 const SLOMO_ZONE_X = canvas.width * 0.25; // 25% of court (last quarter of player's side)
 const SLOMO_FACTOR = 0.48; // Slow-motion speed multiplier (50% faster than previous 0.32)
 
@@ -206,6 +208,16 @@ const ball = {
   speed: BASE_SPEED,
   spin: 0,
   trail: [],
+  enforceMinVx() {
+    const minVx = Math.max(MIN_VX, this.speed * 0.3);
+    if (Math.abs(this.vx) < minVx) {
+      const dir = Math.sign(this.vx) || 1;
+      this.vx = dir * minVx;
+      // Balance vy so total speed magnitude remains consistent
+      const remainingSq = Math.max(0, this.speed * this.speed - this.vx * this.vx);
+      this.vy = (Math.sign(this.vy) || 1) * Math.sqrt(remainingSq);
+    }
+  },
   reset(servingPlayer = true) {
     this.x = canvas.width / 2;
     this.y = canvas.height / 2;
@@ -218,6 +230,7 @@ const ball = {
     const direction = servingPlayer ? 1 : -1;
     this.vx = Math.cos(angle) * this.speed * direction;
     this.vy = Math.sin(angle) * this.speed;
+    this.enforceMinVx();
   }
 };
 
@@ -439,7 +452,7 @@ function update(dt = 1.0) {
   player.y += (player.targetY - player.y) * Math.min(1.0, 0.35 * dt);
   player.vy = (player.y - player.prevY) / dt;
 
-  // 2. Move CPU paddle (AI, dt normalized)
+  // 2. Move CPU paddle (AI, dt normalized + adapts dynamically as round accelerates)
   cpu.prevY = cpu.y;
   const profile = AI_PROFILES[difficulty];
   const cpuCenter = cpu.y + cpu.height / 2;
@@ -451,16 +464,31 @@ function update(dt = 1.0) {
     targetCpuY = canvas.height / 2;
   }
 
+  // CPU reaction speed scales with accelerating round speed to keep rallies intense
+  const speedRatio = ball.speed / BASE_SPEED;
+  const currentCpuSpeed = profile.maxSpeed * (1 + (speedRatio - 1) * 0.45);
+
   const diff = targetCpuY - cpuCenter;
   if (Math.abs(diff) > profile.errorMargin) {
-    const moveStep = Math.sign(diff) * Math.min(Math.abs(diff), profile.maxSpeed * dt);
+    const moveStep = Math.sign(diff) * Math.min(Math.abs(diff), currentCpuSpeed * dt);
     cpu.y += moveStep;
   }
   // Clamp CPU paddle
   cpu.y = Math.max(8, Math.min(canvas.height - cpu.height - 8, cpu.y));
   cpu.vy = (cpu.y - cpu.prevY) / dt;
 
-  // 3. Move Ball (with Slo-Mo in last quarter of player's court)
+  // 3. Move Ball (with progressive acceleration as round continues)
+  const speedAccel = SPEED_ACCEL_PER_SEC * (dt / 60);
+  ball.speed = Math.min(ball.speed + speedAccel, MAX_BALL_SPEED);
+
+  // Synchronize ball velocity magnitude with the progressive speed
+  const currentVelMag = Math.hypot(ball.vx, ball.vy);
+  if (currentVelMag > 0.001) {
+    const scaleFactor = ball.speed / currentVelMag;
+    ball.vx *= scaleFactor;
+    ball.vy *= scaleFactor;
+  }
+
   const currentlyInSloMo = sloMoEnabled && (ball.x <= SLOMO_ZONE_X) && (ball.vx < 0);
   
   if (currentlyInSloMo && !isInSloMo) {
@@ -481,13 +509,17 @@ function update(dt = 1.0) {
     }
   }
 
+  // Ensure minimum horizontal speed so the ball never crawls vertically
+  ball.enforceMinVx();
+
+  const prevBallX = ball.x;
   ball.x += ball.vx * timeScale * dt;
   ball.y += ball.vy * timeScale * dt;
 
-  // Ball trail effect
+  // Ball trail effect (longer trail as round speed climbs)
   const isCurved = curveEnabled && Math.abs(ball.spin) > 0.08;
   ball.trail.push({ x: ball.x, y: ball.y, isSloMo: currentlyInSloMo, isCurved });
-  const maxTrail = currentlyInSloMo ? 14 : 7;
+  const maxTrail = currentlyInSloMo ? 14 : Math.min(13, Math.floor(6 + (ball.speed - BASE_SPEED) * 0.7));
   if (ball.trail.length > maxTrail) {
     ball.trail.shift();
   }
@@ -507,25 +539,27 @@ function update(dt = 1.0) {
     particles.createBurst(ball.x, ball.y, '#ffffff', 8);
   }
 
-  // 4. Paddle Collisions
+  // 4. Paddle Collisions (Anti-tunneling for extreme speeds up to 50)
   // Player collision (left)
+  const playerRight = player.x + player.width;
   if (
-    ball.x - ball.radius <= player.x + player.width &&
-    ball.x + ball.radius >= player.x &&
-    ball.y >= player.y &&
-    ball.y <= player.y + player.height &&
-    ball.vx < 0
+    ball.vx < 0 &&
+    ball.x - ball.radius <= playerRight &&
+    prevBallX - ball.radius >= player.x &&
+    ball.y + ball.radius >= player.y &&
+    ball.y - ball.radius <= player.y + player.height
   ) {
     handlePaddleHit(player);
   }
 
   // CPU collision (right)
+  const cpuLeft = cpu.x;
   if (
-    ball.x + ball.radius >= cpu.x &&
-    ball.x - ball.radius <= cpu.x + cpu.width &&
-    ball.y >= cpu.y &&
-    ball.y <= cpu.y + cpu.height &&
-    ball.vx > 0
+    ball.vx > 0 &&
+    ball.x + ball.radius >= cpuLeft &&
+    prevBallX + ball.radius <= cpu.x + cpu.width &&
+    ball.y + ball.radius >= cpu.y &&
+    ball.y - ball.radius <= cpu.y + cpu.height
   ) {
     handlePaddleHit(cpu);
   }
@@ -557,15 +591,16 @@ function handlePaddleHit(paddle) {
   // Calculate hit angle based on offset from center of paddle (-1 to 1)
   const paddleCenter = paddle.y + paddle.height / 2;
   const offset = (ball.y - paddleCenter) / (paddle.height / 2);
-  const maxBounceAngle = (5 * Math.PI) / 12; // 75 degrees max
+  const maxBounceAngle = (5 * Math.PI) / 16; // ~56.25 degrees max (prevents slow vertical crawling)
   const bounceAngle = offset * maxBounceAngle;
 
   // Increase speed slightly with each volley
-  ball.speed = Math.min(ball.speed + 0.45, MAX_BALL_SPEED);
+  ball.speed = Math.min(ball.speed + 0.35, MAX_BALL_SPEED);
 
   const direction = paddle === player ? 1 : -1;
   ball.vx = Math.cos(bounceAngle) * ball.speed * direction;
   ball.vy = Math.sin(bounceAngle) * ball.speed;
+  ball.enforceMinVx();
 
   // Curve Physics: If enabled, paddle vertical slice velocity curves the ball
   if (curveEnabled) {
@@ -658,6 +693,25 @@ function draw() {
   ctx.arc(canvas.width / 2, canvas.height / 2, 70, 0, Math.PI * 2);
   ctx.stroke();
 
+  // Draw Live Round Speed HUD (top center)
+  const speedRatio = ball.speed / BASE_SPEED;
+  ctx.save();
+  ctx.font = '700 12px Rajdhani, sans-serif';
+  ctx.textAlign = 'center';
+  if (speedRatio >= 1.6) {
+    ctx.fillStyle = '#ff007b';
+    ctx.shadowColor = 'rgba(255, 0, 123, 0.8)';
+    ctx.shadowBlur = 8;
+  } else if (speedRatio >= 1.25) {
+    ctx.fillStyle = '#ffe600';
+    ctx.shadowColor = 'rgba(255, 230, 0, 0.7)';
+    ctx.shadowBlur = 6;
+  } else {
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+  }
+  ctx.fillText(`⚡ SPEED ${speedRatio.toFixed(1)}x`, canvas.width / 2, 28);
+  ctx.restore();
+
   // Draw Ball Trail
   for (let i = 0; i < ball.trail.length; i++) {
     const pt = ball.trail[i];
@@ -668,12 +722,14 @@ function draw() {
       trailColor = '#00f3ff';
     } else if (pt.isCurved) {
       trailColor = '#d880ff';
+    } else if (speedRatio >= 1.5) {
+      trailColor = '#ff6b00'; // High-speed thermal fire trail!
     }
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.fillStyle = trailColor;
     ctx.shadowColor = trailColor;
-    ctx.shadowBlur = (pt.isSloMo || pt.isCurved) ? 10 : 4;
+    ctx.shadowBlur = (pt.isSloMo || pt.isCurved || speedRatio >= 1.5) ? 12 : 4;
     ctx.beginPath();
     ctx.arc(pt.x, pt.y, size, 0, Math.PI * 2);
     ctx.fill();
@@ -692,11 +748,14 @@ function draw() {
   } else if (isCurving) {
     ballColor = '#f080ff';
     glowColor = 'rgba(176, 38, 255, 0.95)';
+  } else if (speedRatio >= 1.55) {
+    ballColor = '#ff3366'; // Fiery plasma ball at high speed
+    glowColor = 'rgba(255, 51, 102, 0.95)';
   }
 
   ctx.fillStyle = ballColor;
   ctx.shadowColor = glowColor;
-  ctx.shadowBlur = (isInSloMo || isCurving) ? 22 : 16;
+  ctx.shadowBlur = (isInSloMo || isCurving || speedRatio >= 1.55) ? 22 : 16;
   ctx.beginPath();
   ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
   ctx.fill();
